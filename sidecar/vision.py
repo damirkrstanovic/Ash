@@ -34,8 +34,21 @@ _SYSTEM = (
     '  "animals": array of animals present, [] if none.\n'
     '  "scene": the activity or scene type ("wedding", "hiking", "sunset") or "".\n'
     '  "tags": array of 3-8 lowercase keywords for filtering.\n'
+    "Describe what you actually see. NEVER output placeholder or bracketed text "
+    "like [Description] or [Location] — fill every field from the image itself.\n"
     "Output ONLY the JSON object."
 )
+
+# Small vision models sometimes echo the field-name placeholders ("[Description]
+# [Location] [Objects]") instead of describing the image — strip those so the
+# garbage never reaches the embedding/search index.
+_PLACEHOLDER_RE = re.compile(r"\[\s*(?:description|location|objects?|animals?|scenes?|tags?)\s*\]", re.IGNORECASE)
+
+
+def _clean_text(text: str) -> str:
+    """Remove echoed [Field] placeholders and tidy the leftover punctuation."""
+    cleaned = _PLACEHOLDER_RE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip(" .,:;-")
 
 def _as_list(v: Any) -> list[str]:
     """Coerce an array field to a clean list. Small models sometimes return a
@@ -142,12 +155,29 @@ async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "input": getattr(u, "prompt_tokens", 0) or 0,
         "output": getattr(u, "completion_tokens", 0) or 0,
     }
+    # Clean each field of echoed [Field] placeholders; drop list items that are
+    # nothing but a placeholder.
+    drop = lambda xs: [x for x in xs if x and not _PLACEHOLDER_RE.fullmatch(x.strip())]
+    description = _clean_text(str(obj.get("description", "")))
+    location = _clean_text(str(obj.get("location", "")))
+    scene = _clean_text(str(obj.get("scene", "")))
+    objects = drop(_as_list(obj.get("objects")))
+    animals = drop(_as_list(obj.get("animals")))
+    tags = [t.lower() for t in drop(_as_list(obj.get("tags")))]
+
+    # If the model gave only placeholders/empty prose, synthesize a description
+    # from the attributes it did extract so the photo still has real search
+    # signal instead of polluting the index with "[Description] [Location] ...".
+    if not description:
+        parts = [p for p in ([scene, location] + objects + animals + tags) if p]
+        description = ", ".join(dict.fromkeys(parts))  # de-duped, order preserved
+
     data = {
-        "description": str(obj.get("description", "")).strip(),
-        "location": str(obj.get("location", "")).strip(),
-        "objects": _as_list(obj.get("objects")),
-        "animals": _as_list(obj.get("animals")),
-        "scene": str(obj.get("scene", "")).strip(),
-        "tags": [t.lower() for t in _as_list(obj.get("tags"))],
+        "description": description,
+        "location": location,
+        "objects": objects,
+        "animals": animals,
+        "scene": scene,
+        "tags": tags,
     }
     return data, usage
